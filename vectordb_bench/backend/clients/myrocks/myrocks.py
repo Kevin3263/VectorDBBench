@@ -74,18 +74,9 @@ class MyRocks(VectorDB):
             log.info(f"{self.name} client use database : {self.db_name}")
             self.cursor.execute(f"USE {self.db_name}")
 
-            # Create centroid table for MyRocks vector indexing
-            # This table stores cluster centroids used by the vector index
-            centroid_table_name = f"{self.table_name}_centroids"
-            log.info(f"{self.name} client create centroid table : {centroid_table_name}")
-            self.cursor.execute(
-                f"""
-              CREATE TABLE {centroid_table_name} (
-                id INT PRIMARY KEY,
-                centroid JSON NOT NULL FB_VECTOR_DIMENSION {dim}
-              ) ENGINE=ROCKSDB
-            """
-            )
+            # Note: Centroids are loaded by RocksDB at C++ level from
+            # /home/kevin/spatial-x-db/vector_index_centroids/centroids_openai_1536d_256.csv
+            # No need to create a centroid table in SQL
 
             # Create main vector table
             log.info(f"{self.name} client create table : {self.table_name}")
@@ -229,35 +220,28 @@ class MyRocks(VectorDB):
 
         index_param = self.case_config.index_param()
 
+        # LSM index now enabled with proper centroids loaded at RocksDB C++ level
+        # Centroids are loaded from /home/kevin/spatial-x-db/vector_index_centroids/centroids_openai_1536d_256.csv
+        # via block_based_table_factory.h SetIndexOptions() method
+
         try:
-            # TODO: LSM index requires proper centroids trained on the dataset
-            # For now, skip index creation to test the pipeline
-            # Uncomment below when proper centroids are available
+            log.info(f"Creating LSM vector index for {self.table_name}")
+            log.info(f"Note: Centroids are loaded by RocksDB from C++ code, not via SQL")
 
-            log.info("Skipping LSM index creation (requires proper centroids)")
-            log.info("MyRocks will use brute-force search without index")
-
-            # # Generate random centroids for testing
-            # # TODO: In production, load pre-computed centroids from CSV file
-            # log.info("Generating random centroids for testing")
-            # self._generate_random_centroids(num_centroids=256)
-
-            # log.info(f"Creating vector index for {self.table_name}")
-
-            # # Create vector index using FB_VECTOR_INDEX_TYPE
-            # # Default to 'lsmidx' for LSM-based index
-            # index_name = f"{self.table_name}_v_idx"
-            # self.cursor.execute(
-            #     f"""
-            #   ALTER TABLE {self.db_name}.{self.table_name}
-            #   ADD INDEX {index_name}(v) FB_VECTOR_INDEX_TYPE 'lsmidx'
-            # """
-            # )
-            # self.conn.commit()
-            # log.info(f"Vector index created for {self.table_name}")
+            # Create vector index using FB_VECTOR_INDEX_TYPE
+            # Default to 'lsmidx' for LSM-based index
+            index_name = f"{self.table_name}_v_idx"
+            self.cursor.execute(
+                f"""
+              ALTER TABLE {self.db_name}.{self.table_name}
+              ADD INDEX {index_name}(v) FB_VECTOR_INDEX_TYPE 'lsmidx'
+            """
+            )
+            self.conn.commit()
+            log.info(f"LSM vector index created successfully for {self.table_name}")
 
         except Exception as e:
-            log.warning(f"Failed to create index: {self.table_name} error: {e}")
+            log.warning(f"Failed to create LSM index: {self.table_name} error: {e}")
             raise e from None
 
     @staticmethod
