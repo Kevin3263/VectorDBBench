@@ -3,10 +3,12 @@
 ## Overview
 This document describes the implementation of a MyRocks database client for VectorDBBench, enabling benchmarking of MyRocks' vector search capabilities using Facebook's vector extensions.
 
-## Implementation Dates
-- **Initial Implementation**: October 17, 2025
-- **LSM Index Enabled**: October 18, 2025
-- **LSM Index Bug Fixed**: October 19, 2025
+**Quick Summary:**
+- ✅ Fully functional MyRocks client with LSM vector index support
+- ✅ Tested with 50K vectors (1536D): ~18 QPS serial, ~110 QPS at concurrency=10
+- ✅ Includes k-means centroid generation script for LSM index
+- ✅ Error 505 bug fixed (field index mismatch resolved)
+- ⚠️ Only L2 distance metric currently supported
 
 ## Status: ✅ FULLY FUNCTIONAL (LSM Index Working!)
 - ✅ Basic pipeline fully functional (insert, search)
@@ -16,6 +18,67 @@ This document describes the implementation of a MyRocks database client for Vect
 - ✅ Concurrent search working (tested up to concurrency=10)
 - ⚠️ Only L2 distance supported (COSINE/IP fall back to L2)
 - ⚠️ High concurrency (80+ connections) may cause OOM on low-memory systems
+
+## Environment Setup
+
+### Prerequisites
+- Python 3.11+
+- Conda (recommended for environment management)
+- MyRocks server with Facebook vector extensions
+
+### Installation Steps
+
+1. **Create and activate conda environment**:
+```bash
+conda create -n vectordbbench python=3.11
+conda activate vectordbbench
+```
+
+2. **Install VectorDBBench package**:
+```bash
+cd /path/to/VectorDBBench
+pip install -e .
+```
+
+3. **Install MySQL connector for MyRocks**:
+```bash
+pip install mysql-connector-python
+```
+
+4. **Verify installation**:
+```bash
+# Test package imports
+python -c "import vectordb_bench; print('VectorDBBench imported successfully')"
+python -c "import mysql.connector; print('MySQL connector imported successfully')"
+python -c "from vectordb_bench.backend.clients.myrocks.myrocks import MyRocks; print('MyRocks client imported successfully')"
+
+# Verify MyRocks is registered in CLI
+python -m vectordb_bench.cli.vectordbbench --help | grep myrocks
+```
+
+### Testing the Environment
+
+After installation, verify your setup with a simple connection test:
+
+```python
+import mysql.connector
+
+# Connect to MyRocks
+conn = mysql.connector.connect(
+    host='127.0.0.1',
+    port=3306,
+    user='root',
+    password='your_password'
+)
+
+cursor = conn.cursor()
+cursor.execute('SHOW DATABASES')
+print(cursor.fetchall())
+cursor.close()
+conn.close()
+```
+
+Expected output: List of databases without errors means your environment is ready!
 
 ## Files Created/Modified
 
@@ -249,77 +312,28 @@ self._load_centroids_from_csv('/tmp/myrocks_centroids.csv')
 
 ## LSM Index Bug Fix (October 19, 2025) ✅
 
-### Problem Description
-**Error**: RocksDB error 505 "Found data corruption" during vector search queries
-**Initial Status**: LSM index could not be used for vector search
-**Final Status**: ✅ **RESOLVED** - LSM index fully operational
+### Issue Summary
+**Problem**: RocksDB error 505 "Found data corruption" during vector search queries
+**Root Cause**: Hardcoded field index mismatch in `rdb_vector_db.cc`
+**Status**: ✅ **RESOLVED** - LSM index fully operational
 
-### Root Cause Analysis
+### Required Fixes
 
-**Investigation Timeline:**
-
-**Phase 1 (October 18)**: Initial error 505 investigation
-- Discovered centroids must be loaded at RocksDB C++ level (not via SQL)
-- Updated centroid loading mechanism in `block_based_table_factory.h`
-- Error persisted despite correct centroid loading
-
-**Phase 2 (October 19)**: Field index debugging
-- Found hardcoded field index `{8}` in `rdb_vector_db.cc`
-- Original value designed for `poi` table structure (10 columns, vector at position 8)
-- Our test table has different structure: `(id INT PRIMARY KEY, v JSON)`
-- **Key insight**: Primary key fields are excluded from RocksDB field indexing
-
-### The Bug
-
+#### Fix 1: Field Index Correction
 **Location**: `/home/kevin/spatial-x-db/storage/rocksdb/rdb_vector_db.cc` (lines 1255 and 1520)
 
-**Incorrect Code** (designed for different table structure):
 ```cpp
-// BROKEN: Hardcoded for 'poi' table where text_embedding is at field 8
-std::vector<size_t> field_indexes_to_extract = {8};
-```
-
-**Fixed Code**:
-```cpp
-// FIXED: Changed from {8} to {0} for simple test table
+// Changed from {8} to {0}
 // Field index 0 = first non-PK column (vector column 'v')
-// Original {8} was for 'poi' table where text_embedding is at field 8
 std::vector<size_t> field_indexes_to_extract = {0};
 ```
 
-### Why This Caused Error 505
+**Explanation**: The original hardcoded value `{8}` was designed for a `poi` table with 10 columns. For our table structure `(id INT PRIMARY KEY, v JSON)`, the vector column is at field index 0 (first non-primary-key field).
 
-The field index mismatch caused `DecodeFieldFromValue()` to:
-1. Attempt to extract field at position 8 (which doesn't exist in our table)
-2. Return invalid/corrupted data
-3. Trigger RocksDB's data corruption detection (error 505)
-4. Fail all vector search queries with LSM index enabled
+⚠️ **Note**: This field index is table-specific and must be adjusted based on your schema.
 
-**Table Structure Comparison:**
-
-| Table | Structure | Vector Column | Field Index |
-|-------|-----------|---------------|-------------|
-| `poi` (original) | 10 columns total | `text_embedding` (9th column) | 8 (after excluding PK) |
-| `vec_collection` (ours) | 2 columns total | `v` (2nd column) | 0 (after excluding PK) |
-
-### Testing & Verification
-
-**Test 1: Simple 3D Vectors** ✅
-- Created test table with 3D vectors
-- Loaded 4 centroids matching test data
-- **Result**: All queries successful, no error 505
-
-**Test 2: Full 1536D Dataset** ✅
-- Loaded 50K OpenAI embeddings (1536 dimensions)
-- Used 256 k-means centroids
-- **Result**: All tests passing (load, serial search, concurrent search)
-
-### Lessons Learned
-
-1. **Field indexing is table-specific**: Hardcoded field indexes break when table structure changes
-2. **Primary keys are excluded**: Field index 0 = first non-PK column, not first table column
-3. **Debug logging is critical**: Added extensive logging to track centroid loading and field detection
-4. **Systematic testing**: Testing with simpler data (3D vectors) helped isolate the issue quickly
+#### Fix 2: Centroid Loading at C++ Level
+Centroids must be loaded at the RocksDB C++ level, not via SQL. The implementation in `/home/kevin/spatial-x-db/rocksdb/table/block_based/block_based_table_factory.h` handles this automatically during table initialization.
 
 ## Next Steps
 
@@ -386,47 +400,7 @@ The field index mismatch caused `DecodeFieldFromValue()` to:
 
 ## Quick Start Guide
 
-### Option A: Without LSM Index (Current Working Method)
-
-This is the **recommended approach** until the LSM index error 505 issue is resolved.
-
-**Step 1: Run Benchmark (Brute-Force Search)**
-```bash
-# Run complete benchmark without LSM index (brute-force search)
-# Note: LSM index creation is disabled in optimize() method
-python -m vectordb_bench.cli.vectordbbench myrocks \
-  --username root \
-  --password 150131 \
-  --host 127.0.0.1 \
-  --port 3306 \
-  --db-label "myrocks-bruteforce" \
-  --case-type Performance1536D50K \
-  --drop-old
-```
-
-**Step 2: Load-Only Test (Optional)**
-```bash
-# Test just data loading without search
-python -m vectordb_bench.cli.vectordbbench myrocks \
-  --username root \
-  --password 150131 \
-  --case-type Performance1536D50K \
-  --drop-old \
-  --load \
-  --skip-search-serial \
-  --skip-search-concurrent
-```
-
-**Performance Notes:**
-- Insert: ~500 vectors/second (50K in ~98 seconds)
-- Search: Brute-force (slow but functional)
-- No index creation required
-
----
-
-### Option B: With LSM Index (Future - Currently Blocked)
-
-⚠️ **WARNING**: LSM index causes RocksDB error 505 during search. Use this only for testing or when the MyRocks bug is fixed.
+### Running Benchmarks with LSM Index
 
 **Step 1: Generate Centroids**
 ```bash
@@ -451,45 +425,31 @@ K-means clustering completed in 3.56 seconds
   File size: 8851.47 KB
 ```
 
-**Step 2: Enable LSM Index in Code**
-
-Uncomment the LSM index creation code in `vectordb_bench/backend/clients/myrocks/myrocks.py:226-254`:
-
-```python
-def optimize(self, data_size: int | None = None) -> None:
-    try:
-        # Load pre-computed centroids from CSV file
-        centroids_path = "/tmp/myrocks_centroids.csv"
-        self._load_centroids_from_csv(centroids_path)
-
-        # Create LSM vector index
-        index_name = f"{self.table_name}_v_idx"
-        self.cursor.execute(f"""
-            ALTER TABLE {self.db_name}.{self.table_name}
-            ADD INDEX {index_name}(v) FB_VECTOR_INDEX_TYPE 'lsmidx'
-        """)
-        self.conn.commit()
-    except Exception as e:
-        log.warning(f"Failed to create index: {e}")
-        raise
-```
-
-**Step 3: Run Benchmark**
+**Step 2: Run Benchmark**
 ```bash
-# Run complete benchmark with LSM index enabled
+# Run complete benchmark with LSM index
 python -m vectordb_bench.cli.vectordbbench myrocks \
   --username root \
-  --password 150131 \
+  --password YOUR_PASSWORD \
   --host 127.0.0.1 \
   --port 3306 \
-  --db-label "myrocks-lsm-test" \
+  --db-label "myrocks-lsm" \
   --case-type Performance1536D50K \
   --drop-old
 ```
 
-**Known Issue:**
-- Loading phase: ✅ Works (centroids load in <1s, index creates in ~1.7s)
-- Search phase: ❌ Fails with error 505 "Found data corruption"
+**Step 3: Load-Only Test (Optional)**
+```bash
+# Test just data loading without search
+python -m vectordb_bench.cli.vectordbbench myrocks \
+  --username root \
+  --password YOUR_PASSWORD \
+  --case-type Performance1536D50K \
+  --drop-old \
+  --load \
+  --skip-search-serial \
+  --skip-search-concurrent
+```
 
 ### Connection Parameters
 - `--username`: MySQL username (default: root)
@@ -551,25 +511,16 @@ CREATE TABLE vec_collection_centroids (
 - **DB registration**: `__init__.py:54, 204-207, 360-363, 491-494`
 - **CLI registration**: `vectordbbench.py:9, 45`
 
-## Known Issues
+## Known Limitations
 
-### Issue 1: Data Corruption with Random Centroids
-- **Error**: `Got error 505 'Found data corruption.' from ROCKSDB`
-- **Cause**: LSM index requires centroids that match data distribution
-- **Status**: Resolved by disabling index creation
-- **Fix**: Need proper centroid training
+### Distance Metrics
+- **Supported**: L2 (Euclidean) distance via `FB_VECTOR_L2()`
+- **Not Yet Available**: COSINE and Inner Product (IP)
+- **Current Behavior**: All metrics fall back to L2 distance
 
-### Issue 2: Metric Type Validation
-- **Error**: `Metric type MetricType.COSINE is not supported!`
-- **Cause**: Config validation was too strict
-- **Status**: Resolved by accepting all metrics and using L2 as fallback
-- **Fix**: Update when COSINE support added to MyRocks
-
-### Issue 3: Missing data_size Parameter
-- **Error**: `MyRocks.optimize() got an unexpected keyword argument 'data_size'`
-- **Cause**: VectorDB interface requires this parameter
-- **Status**: Resolved by adding parameter to method signature
-- **Fix**: Complete
+### Concurrency
+- **Recommended**: Up to 10-20 concurrent connections
+- **High Concurrency**: 80+ connections may cause OOM on systems with 15GB RAM or less
 
 ## Dependencies
 
@@ -583,71 +534,19 @@ CREATE TABLE vec_collection_centroids (
 - Facebook vector extensions enabled
 - Vector functions available: `FB_VECTOR_L2()`, `FB_VECTOR_DIMENSION`, `FB_VECTOR_INDEX_TYPE`
 
+## Important Notes
+
+### LSM Index Requirements
+The LSM vector index requires:
+1. **Proper centroids**: Generated via k-means clustering on actual training data (not random)
+2. **C++ level loading**: Centroids are loaded at RocksDB C++ initialization (see `block_based_table_factory.h`)
+3. **Field index alignment**: Field index in `rdb_vector_db.cc` must match table schema
+
+### Table-Specific Configuration
+The field index in `/home/kevin/spatial-x-db/storage/rocksdb/rdb_vector_db.cc` is hardcoded to `{0}` for the standard VectorDBBench table structure `(id INT PRIMARY KEY, v JSON)`. If you use a different table schema, adjust this value accordingly.
+
 ## References
 
 - VectorDBBench Repository: https://github.com/zilliztech/VectorDBBench
 - MyRocks Documentation: (Add link when available)
 - Facebook Vector Extensions: (Add link when available)
-
-## Important Notes for Continuation
-
-### Why LSM Index is Disabled
-The LSM index requires centroids that are computed using k-means clustering on the actual training data. Random centroids cause RocksDB corruption errors because:
-1. LSM index uses centroids to partition the vector space
-2. Queries use centroids to narrow down search space
-3. If centroids don't match data distribution, the index becomes inconsistent
-4. This manifests as error 505: "Found data corruption"
-
-### To Enable LSM Index (Step-by-Step)
-1. **Generate centroids**:
-   ```python
-   # Use k-means on training dataset
-   from sklearn.cluster import KMeans
-   import pandas as pd
-
-   # Load training vectors
-   vectors = load_training_data()  # Your 50K vectors
-
-   # Cluster into 256 centroids
-   kmeans = KMeans(n_clusters=256, random_state=42)
-   kmeans.fit(vectors)
-   centroids = kmeans.cluster_centers_
-
-   # Save to CSV
-   df = pd.DataFrame({
-       'id': range(256),
-       'centroid': [json.dumps(c.tolist()) for c in centroids]
-   })
-   df.to_csv('centroids.csv', index=False)
-   ```
-
-2. **Update optimize() method** in `myrocks.py:226-257`:
-   - Replace line 243 with: `self._load_centroids_from_csv('/path/to/centroids.csv')`
-   - Uncomment lines 245-257 (index creation code)
-
-3. **Test with proper centroids**:
-   ```bash
-   python -m vectordb_bench.cli.vectordbbench myrocks \
-     --username root --password 150131 \
-     --host 127.0.0.1 --port 3306 \
-     --case-type Performance1536D50K
-   ```
-
-### MySQL Connection Details
-- **Database**: Creates `vectordbbench` database
-- **Socket**: `/tmp/mysql.sock`
-- **Password**: 150131 (used in testing)
-- **MyRocks location**: `/home/kevin/backup/myrocks-runtime/usr/local/mysql`
-- **Start command**: `bin/mysqld --defaults-file=/path/to/my.cnf &`
-
-### Vector Load SQL Example
-Location: `vectordb_bench/backend/clients/myrocks/vector_load.sql`
-- Shows how to create tables with FB_VECTOR_DIMENSION
-- Shows how to create index with FB_VECTOR_INDEX_TYPE 'lsmidx'
-- Shows LOAD DATA INFILE for bulk loading
-- Important: Uses CAST(@embedding AS JSON) for vector insertion
-
-## Contributors
-- Implementation: Claude Code + Kevin
-- Testing: Kevin
-- Date: October 17, 2025
