@@ -73,16 +73,28 @@ class AliyunOSSReader(DatasetReader):
         if not local_ds_root.exists():
             log.info(f"local dataset root path not exist, creating it: {local_ds_root}")
             local_ds_root.mkdir(parents=True)
-            downloads = [
-                (
+            # Apply skip logic even for new directories
+            for f in files:
+                if f == "neighbors.parquet" and ("cohere" in dataset.lower() or "gist" in dataset.lower()):
+                    log.warning(f"Skipping download of custom L2 ground truth for {dataset}: {f}")
+                    continue
+                downloads.append((
                     pathlib.PurePosixPath("benchmark", dataset, f),
                     local_ds_root.joinpath(f),
-                )
-                for f in files
-            ]
+                ))
 
         else:
             for file in files:
+                # Skip validation for custom L2 ground truth (Cohere and GIST)
+                if file == "neighbors.parquet" and ("cohere" in dataset.lower() or "gist" in dataset.lower()):
+                    local_file = local_ds_root.joinpath(file)
+                    if local_file.exists():
+                        log.info(f"⚠️  Skipping validation for custom L2 ground truth: {local_file}")
+                        continue
+                    else:
+                        log.warning(f"Custom L2 ground truth not found: {local_file}, skipping download")
+                        continue
+
                 remote_file = pathlib.PurePosixPath("benchmark", dataset, file)
                 local_file = local_ds_root.joinpath(file)
 
@@ -123,10 +135,25 @@ class AwsS3Reader(DatasetReader):
         if not local_ds_root.exists():
             log.info(f"local dataset root path not exist, creating it: {local_ds_root}")
             local_ds_root.mkdir(parents=True)
-            downloads = [pathlib.PurePosixPath(self.remote_root, dataset, f) for f in files]
+            # Apply skip logic even for new directories
+            for f in files:
+                if f == "neighbors.parquet" and ("cohere" in dataset.lower() or "gist" in dataset.lower()):
+                    log.warning(f"Skipping download of custom L2 ground truth for {dataset}: {f}")
+                    continue
+                downloads.append(pathlib.PurePosixPath(self.remote_root, dataset, f))
 
         else:
             for file in files:
+                # Skip validation for custom L2 ground truth (Cohere and GIST)
+                if file == "neighbors.parquet" and ("cohere" in dataset.lower() or "gist" in dataset.lower()):
+                    local_file = local_ds_root.joinpath(file)
+                    if local_file.exists():
+                        log.info(f"⚠️  Skipping validation for custom L2 ground truth: {local_file}")
+                        continue
+                    else:
+                        log.warning(f"Custom L2 ground truth not found: {local_file}, skipping download")
+                        continue
+
                 remote_file = pathlib.PurePosixPath(self.remote_root, dataset, file)
                 local_file = local_ds_root.joinpath(file)
 

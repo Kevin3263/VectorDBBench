@@ -14,13 +14,13 @@ from ....cli.cli import (
 
 
 class MyRocksTypedDict(CommonTypedDict):
-    user_name: Annotated[
+    username: Annotated[
         str,
         click.option(
             "--username",
             type=str,
             help="Username",
-            required=True,
+            default="root",
         ),
     ]
     password: Annotated[
@@ -32,24 +32,13 @@ class MyRocksTypedDict(CommonTypedDict):
             required=True,
         ),
     ]
-
-    host: Annotated[
-        str,
-        click.option(
-            "--host",
-            type=str,
-            help="Db host",
-            default="127.0.0.1",
-        ),
-    ]
-
-    port: Annotated[
+    nprobe: Annotated[
         int,
         click.option(
-            "--port",
+            "--nprobe",
             type=int,
-            default=3306,
-            help="Db Port",
+            help="Number of nearest centroids to search (1-10000, default: 16)",
+            default=16,
         ),
     ]
 
@@ -67,9 +56,9 @@ def MyRocks(
             db_label=parameters["db_label"],
             user_name=parameters["username"],
             password=SecretStr(parameters["password"]),
-            host=parameters["host"],
-            port=parameters["port"],
         ),
-        db_case_config=MyRocksLSMConfig(),
+        db_case_config=MyRocksLSMConfig(
+            nprobe=parameters["nprobe"],
+        ),
         **parameters,
     )

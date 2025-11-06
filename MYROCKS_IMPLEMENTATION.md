@@ -5,548 +5,495 @@ This document describes the implementation of a MyRocks database client for Vect
 
 **Quick Summary:**
 - ✅ Fully functional MyRocks client with LSM vector index support
-- ✅ Tested with 50K vectors (1536D): ~18 QPS serial, ~110 QPS at concurrency=10
-- ✅ Includes k-means centroid generation script for LSM index
+- ✅ Configured for Cohere 768D dataset
+- ✅ L2-based ground truth generated for valid recall metrics
+- ✅ Centroids generated (256 and 512 clusters)
 - ✅ Error 505 bug fixed (field index mismatch resolved)
+- ✅ nprobe parameter support added (configurable search radius)
 - ⚠️ Only L2 distance metric currently supported
 
-## Status: ✅ FULLY FUNCTIONAL (LSM Index Working!)
-- ✅ Basic pipeline fully functional (insert, search)
-- ✅ Centroid generation script created and working
-- ✅ **LSM vector index fully operational** (error 505 fixed!)
-- ✅ Tested with 50K vectors (1536D) - all tests passing
-- ✅ Concurrent search working (tested up to concurrency=10)
-- ⚠️ Only L2 distance supported (COSINE/IP fall back to L2)
-- ⚠️ High concurrency (80+ connections) may cause OOM on low-memory systems
+## Current Environment (October 24-25, 2025)
 
-## Environment Setup
+### System Configuration
+- **Location**: `/home/kunhao/`
+- **Python**: 3.11.14
+- **VectorDBBench**: `/home/kunhao/VectorDBBench`
+- **VectorDBBench Conda Env**: `vectordbbench` (clean install as of Oct 24)
+- **spatial-x-db**: `/home/kunhao/spatial-x-db`
+- **MyRocks Runtime**: `/home/kunhao/myrocks-runtime`
+- **MySQL Socket**: `/home/kunhao/myrocks-runtime/mysql.sock`
+- **MySQL Password**: `150131`
 
-### Prerequisites
-- Python 3.11+
-- Conda (recommended for environment management)
-- MyRocks server with Facebook vector extensions
+### Python Environment
+- **NumPy**: 2.3.4
+- **Pandas**: 2.3.3
+- **PyArrow**: 21.0.0 (clean install, compatible)
+- **MySQL Connector**: 9.5.0
 
-### Installation Steps
+### Supported Datasets
 
-1. **Create and activate conda environment**:
-```bash
-conda create -n vectordbbench python=3.11
-conda activate vectordbbench
-```
+#### Cohere 768D (L2 Ground Truth)
+- **Dimension**: 768D
+- **Size**: 1M vectors
+- **Metric**: L2 (converted from COSINE)
+- **Location**: `/tmp/vectordb_bench/dataset/cohere/cohere_medium_1m/`
+- **Ground Truth**: ✅ L2-based (4.7 MB, 1000 queries × 1000 neighbors)
 
-2. **Install VectorDBBench package**:
-```bash
-cd /path/to/VectorDBBench
-pip install -e .
-```
+#### GIST 960D (L2 Metric)
+- **Dimension**: 960D
+- **Size**: 1M vectors
+- **Metric**: L2
+- **Location**: `/tmp/vectordb_bench/dataset/gist/gist_medium_1m/`
+- **Downloaded**: ✅ Oct 26, 2025 (2.5 GB)
 
-3. **Install MySQL connector for MyRocks**:
-```bash
-pip install mysql-connector-python
-```
+#### Available Centroids
 
-4. **Verify installation**:
-```bash
-# Test package imports
-python -c "import vectordb_bench; print('VectorDBBench imported successfully')"
-python -c "import mysql.connector; print('MySQL connector imported successfully')"
-python -c "from vectordb_bench.backend.clients.myrocks.myrocks import MyRocks; print('MyRocks client imported successfully')"
+**Standard k-means (sklearn)**:
+- **256 clusters**: `centroids_cohere_768d_256.csv` (4.0 MB, Oct 22)
+- **512 clusters**: `centroids_cohere_768d_512.csv` (8.0 MB, Oct 23)
 
-# Verify MyRocks is registered in CLI
-python -m vectordb_bench.cli.vectordbbench --help | grep myrocks
-```
+**Balanced k-means (GPU-accelerated, PyTorch)**:
+- **256 clusters**: `centroids_cohere_768d_256_balanced.csv` (4.0 MB, Oct 24 16:17)
+  - Perfect balance on training data (<1% imbalance)
+  - 10-30% imbalance on full dataset (acceptable for LSM)
+- **512 clusters**: `centroids_cohere_768d_512_balanced.csv` (8.0 MB, Oct 24 16:28)
+  - Generated using balanced-kmeans library
+  - Trained on 300K sample vectors
+  - Format: RocksDB (quoted JSON arrays)
 
-### Testing the Environment
+**GIST 960D (FAISS k-means)**:
+- **256 clusters**: `centroids_gist_960d_256.csv` (5.0 MB, Oct 26 15:28)
+  - Generated using FAISS k-means (optimized for IVF)
+  - Reconstruction loss: 1.19 (excellent for IVF recall)
+  - Trained on full 1M vectors
+  - Format: RocksDB (quoted JSON arrays)
 
-After installation, verify your setup with a simple connection test:
+**Current Active**: Cohere 512 balanced (`centroids_cohere_768d_512_balanced.csv`)
 
-```python
-import mysql.connector
+## VectorDBBench Modifications
 
-# Connect to MyRocks
-conn = mysql.connector.connect(
-    host='127.0.0.1',
-    port=3306,
-    user='root',
-    password='your_password'
-)
+### Files Modified
 
-cursor = conn.cursor()
-cursor.execute('SHOW DATABASES')
-print(cursor.fetchall())
-cursor.close()
-conn.close()
-```
+#### 1. `vectordb_bench/backend/dataset.py`
+Updated dataset configurations:
+- Line 159: Changed Cohere `metric_type: MetricType = MetricType.L2`
 
-Expected output: List of databases without errors means your environment is ready!
+#### 2. `vectordb_bench/backend/clients/myrocks/config.py`
+- Changed connection from TCP (host:port) to Unix socket
+- Hardcoded socket path: `/home/kunhao/myrocks-runtime/mysql.sock`
+- Added `nprobe: int = 16` parameter to `MyRocksLSMConfig`
+- Added nprobe to `search_param()` method
 
-## Files Created/Modified
+#### 3. `vectordb_bench/backend/clients/myrocks/cli.py`
+- Removed `--host` and `--port` CLI options
+- Made `--username` optional (default: `root`)
+- Added `--nprobe` CLI option (default: 16)
+- CLI now requires only `--password`
 
-### 1. VectorDBBench Repository (This Repo)
-#### Core Implementation Files
-- `vectordb_bench/backend/clients/myrocks/myrocks.py` - Main MyRocks client implementation
-- `vectordb_bench/backend/clients/myrocks/config.py` - Configuration classes for MyRocks
-- `vectordb_bench/backend/clients/myrocks/cli.py` - Command-line interface for benchmarking
-- `vectordb_bench/backend/clients/myrocks/vector_load.sql` - Example SQL for vector data loading
-- `generate_centroids.py` - **NEW**: K-means centroid generation script
+#### 4. `vectordb_bench/backend/clients/myrocks/myrocks.py`
+- Added code in `init()` method to set `fb_vector_search_nprobe` session variable
+- Reads nprobe value from `case_config.search_param()`
 
-#### Integration Files Modified
-- `vectordb_bench/backend/clients/__init__.py` - Registered MyRocks in DB enum and config mappings
-- `vectordb_bench/cli/vectordbbench.py` - Added MyRocks CLI command
+## MyRocks C++ Configuration
 
-#### Generated Assets
-- `/tmp/myrocks_centroids.csv` - **NEW**: Pre-computed centroids (256 centroids, 1536 dimensions, 8.6 MB)
+### Critical Files
 
-### 2. External Repository Changes (Cannot Be Pushed)
+#### File 1: `storage/rocksdb/rdb_vector_db.cc` (Lines 1255, 1520)
+**Purpose**: LSM vector index search implementation
 
-⚠️ **IMPORTANT**: The following changes were made to external repositories (`/home/kevin/spatial-x-db/`) and cannot be pushed to this VectorDBBench repository. These must be maintained separately or upstreamed to the spatial-x-db project.
-
-#### File 1: `/home/kevin/spatial-x-db/storage/rocksdb/rdb_vector_db.cc`
-**Purpose**: Core LSM vector index search implementation in RocksDB
-
-**Critical Bug Fix** (lines 1255 and 1520):
+**Configuration**:
 ```cpp
-// BEFORE (BROKEN - designed for 'poi' table):
-std::vector<size_t> field_indexes_to_extract = {8};
-
-// AFTER (FIXED - for our simple table structure):
-// Field index 0 = first non-PK column (vector column 'v')
-// Original {8} was for 'poi' table where text_embedding is at field 8
-std::vector<size_t> field_indexes_to_extract = {0};
+std::vector<size_t> field_indexes_to_extract = {0};  // First non-PK column
 ```
 
-**Why This Was Critical**: The hardcoded value `{8}` was designed for a specific `poi` table structure with 10 columns where `text_embedding` was the 9th column (index 8 after excluding primary key). For our test table with structure `(id INT PRIMARY KEY, v JSON)`, the vector column is at field index 0 (first non-primary-key field). This mismatch caused `DecodeFieldFromValue()` to fail, returning error 505 "Found data corruption."
+**Why Critical**: Must match table schema `(id INT PRIMARY KEY, v JSON)`
+- Field index `{0}` = first non-primary-key column (vector column 'v')
+- Mismatch causes error 505 "Found data corruption"
 
-**⚠️ Note**: This hardcoded field index is table-specific and will need to be adjusted based on your table schema. A more robust solution would make this configurable.
+#### File 2: `rocksdb/table/block_based/block_based_table_factory.h` (Lines 103, 108)
+**Purpose**: RocksDB configuration, loads centroids at C++ level
 
-#### File 2: `/home/kevin/spatial-x-db/rocksdb/table/block_based/block_based_table_factory.h`
-**Purpose**: RocksDB table factory configuration, loads centroids at C++ level
-
-**Key Changes in `SetIndexOptions()` method** (lines 102-264):
-
-1. **Centroid File Path Configuration** (line 108):
+**Current Configuration** (Cohere 768D, 512 Balanced Centroids):
 ```cpp
-// Updated path to load centroids from project-specific location
+const size_t vector_dim = 768;  // Vector dimension
+
 std::string centroids_path = std::string(SPATIAL_X_DB_ROOT) +
-  "/vector_index_centroids/centroids_openai_1536d_256.csv";
+    "/vector_index_centroids/centroids_cohere_768d_512_balanced.csv";
 ```
 
-2. **Added Robust CSV Parsing** (lines 119-204):
-```cpp
-// Enhanced parsing to handle:
-// - Quoted JSON arrays with surrounding quotes
-// - Variable whitespace and line endings
-// - Validation of centroid dimensions
-// - Error reporting with line numbers
-```
+**Previous Configurations**:
+- 256 standard: `centroids_cohere_768d_256.csv`
+- 512 standard: `centroids_cohere_768d_512.csv`
+- 256 balanced: `centroids_cohere_768d_256_balanced.csv`
 
-3. **Added Debug Logging** (lines 211-261):
-```cpp
-// DEBUG: Log centroid loading success
-fprintf(stderr, "[DEBUG] Loaded %zu centroids with dimension %zu from %s\n",
-        centroids.size(), vector_dim, centroids_path.c_str());
-
-// Check if field contains vector index (type 245)
-fprintf(stderr, "[DEBUG] Found vector field (type 245) at index %d, enabling inverted list index\n", count);
-fprintf(stderr, "[DEBUG] Vector index configured: vector_size=%zu, num_centroids=%zu\n",
-        table_options_.vector_size, table_options_.global_centroids.size());
-```
-
-**Key Configuration Values**:
-- `vector_dim = 1536` (OpenAI embedding dimension)
-- `num_centroids = 256` (loaded from CSV file)
-- Centroid file format: One quoted JSON array per line, no header
-
-#### File 3: `/home/kevin/spatial-x-db/vector_index_centroids/centroids_openai_1536d_256.csv`
-**Purpose**: Pre-computed k-means centroids for LSM index
-- **Format**: One quoted JSON array per line (e.g., `"[0.123, 0.456, ...]"`)
-- **Size**: 8.6 MB (256 centroids × 1536 dimensions)
-- **Generation**: K-means clustering on 50K training vectors using `generate_centroids.py --rocksdb-format`
-- **Location**: Must be in `spatial-x-db/vector_index_centroids/` directory
-
-**⚠️ Important Notes**:
-1. These changes are **required for LSM vector index to work**
-2. The field index in `rdb_vector_db.cc` must match your table structure
-3. Centroids must be regenerated for different vector dimensions
-4. The `SPATIAL_X_DB_ROOT` compile-time constant must point to the correct path
-
-## Key Features Implemented
-
-### 1. Database Connection
-- Uses `mysql-connector-python` to connect to MyRocks
-- Supports standard MySQL connection parameters (host, port, user, password)
-
-### 2. Vector Storage
-- Stores vectors as **JSON type** with `FB_VECTOR_DIMENSION` attribute
-- Converts Python arrays to JSON format for storage
-- Example: `CREATE TABLE vectors (id INT PRIMARY KEY, v JSON NOT NULL FB_VECTOR_DIMENSION 128) ENGINE=ROCKSDB`
-
-### 3. Centroid Loading
-- Centroids loaded **at RocksDB C++ level** (not via SQL)
-- Uses `SetIndexOptions()` in `block_based_table_factory.h`
-- Loads from: `/home/kevin/spatial-x-db/vector_index_centroids/centroids_openai_1536d_256.csv`
-- Format: One quoted JSON array per line, no header
-- Generated using k-means clustering on training data
-
-### 4. Index Support
-- ✅ **FULLY WORKING**: LSM-based vector index operational
-- ✅ **CENTROIDS**: K-means centroids (256 clusters, 1536D) loaded correctly
-- ✅ **SEARCH**: Vector search with LSM index fully functional
-- ✅ **PERFORMANCE**: ~110 QPS at concurrency=10, ~18 QPS serial
-- ✅ **BUG FIXED**: Hardcoded field index corrected (details below)
-
-### 5. Vector Search
-- Uses `FB_VECTOR_L2()` function for L2 distance calculations
-- Query format: `SELECT id, FB_VECTOR_L2(table.v, '[vector]') AS dis FROM table ORDER BY dis ASC LIMIT k`
-- Currently supports L2 distance metric only
-- Fallback to L2 for COSINE and IP metrics (until MyRocks adds those functions)
-
-## Testing Results (October 19, 2025)
-
-### Test Configuration
-- **Dataset**: OpenAI embeddings (1536 dimensions, 50K vectors)
-- **Test Case**: Performance1536D50K
-- **Index**: LSM index with 256 k-means centroids
-- **System**: 15 GB RAM
-
-### Comprehensive Test Results
-
-#### ✅ Test 1: Load + Index Creation Only
-- **Insert duration**: 101.27 seconds (~495 vectors/second)
-- **Index creation**: 1.28 seconds
-- **Total load time**: 102.55 seconds
-- **Status**: SUCCESS
-
-#### ✅ Test 2: Serial Search (Single Connection)
-- **Queries**: 1000
-- **Duration**: 56.08 seconds
-- **QPS**: ~18 queries/second
-- **P99 latency**: 0.0969 seconds
-- **P95 latency**: 0.0569 seconds
-- **Recall**: 6.15% (expected for LSM approximate search)
-- **Status**: SUCCESS
-
-#### ✅ Test 3: Concurrent Search (Various Concurrency Levels)
-
-| Concurrency | QPS    | P99 Latency | P95 Latency | Status  |
-|-------------|--------|-------------|-------------|---------|
-| 1           | 17.76  | 0.0699s     | 0.0572s     | ✅ PASS |
-| 5           | 74.24  | 0.1033s     | 0.0739s     | ✅ PASS |
-| 10          | 109.96 | 0.1349s     | 0.1286s     | ✅ PASS |
-| 80          | -      | -           | -           | ❌ OOM  |
-
-**Key Findings**:
-- Linear scaling up to concurrency=10
-- OOM (Out of Memory) occurs at concurrency=80 on 15GB RAM system
-- Recommended max concurrency: 10-20 for production use
-
-## Current Limitations
-
-### 1. Distance Metrics
-- **Supported**: L2 (Euclidean) via `FB_VECTOR_L2()`
-- **Not Yet Supported**: COSINE, Inner Product
-- **Workaround**: Currently falls back to L2 for all metrics
-
-## Helper Tools Created
-
-### 1. Centroid Generation Script (`generate_centroids.py`)
-
-**Location**: `/home/kevin/VectorDBBench/generate_centroids.py`
-
-**Purpose**: Generate k-means centroids from training data for LSM index
-
-**Usage**:
+**Important**: After changing centroids path, MyRocks must be rebuilt:
 ```bash
-# Basic usage (uses defaults)
-python generate_centroids.py
+cd /home/kunhao/spatial-x-db
+make -j$(nproc)
+# Then restart MySQL server
+```
 
-# Custom configuration
+## Centroid Generation
+
+### Standard k-means: `generate_centroids.py`
+
+**Location**: `/home/kunhao/VectorDBBench/generate_centroids.py`
+
+**Usage Example**:
+
+```bash
+# Cohere 768D (256 clusters)
 python generate_centroids.py \
-  --dataset-path /tmp/vectordb_bench/dataset/openai/openai_small_50k/shuffle_train.parquet \
+  --dataset-path /tmp/vectordb_bench/dataset/cohere/cohere_medium_1m/train.parquet \
   --num-centroids 256 \
-  --output /tmp/myrocks_centroids.csv \
-  --random-state 42
-
-# For large datasets, limit samples
-python generate_centroids.py \
+  --output /home/kunhao/spatial-x-db/vector_index_centroids/centroids_cohere_768d_256.csv \
   --max-samples 100000 \
-  --num-centroids 512
+  --rocksdb-format
 ```
 
-**Parameters**:
-- `--dataset-path`: Path to training parquet file (default: OpenAI 50K dataset)
-- `--num-centroids`: Number of centroids to generate (default: 256)
-- `--max-samples`: Limit samples for faster processing (default: use all)
-- `--output`: Output CSV file path (default: `/tmp/myrocks_centroids.csv`)
-- `--random-state`: Random seed for reproducibility (default: 42)
+### Balanced k-means: `generate_centroids_balanced.py`
 
-**Features**:
-- Automatic detection of vector column in parquet files
-- Uses MiniBatchKMeans for large datasets (>10K vectors)
-- Validates output CSV format
-- Reports clustering metrics (inertia, convergence)
+**Location**: `/home/kunhao/VectorDBBench/generate_centroids_balanced.py`
 
-**Output Format**:
-```csv
-id,centroid
-0,"[0.123, 0.456, ...]"
-1,"[0.789, 0.012, ...]"
-...
-```
+**Documentation**: See `CENTROID_GENERATION.md` for detailed guide
 
-### 2. Centroid Loading (`_load_centroids_from_csv()`)
+**Usage Example**:
 
-**Location**: `myrocks.py:174-224`
-
-**Purpose**: Load pre-computed centroids into MyRocks centroid table
-
-**Usage**: Called automatically during `optimize()` phase
-```python
-self._load_centroids_from_csv('/tmp/myrocks_centroids.csv')
-```
-
-**CSV Format Requirements**:
-- Column 1: `id` (integer, sequential starting from 0)
-- Column 2: `centroid` (JSON array string)
-- Must match vector dimension of main table
-
-## LSM Index Bug Fix (October 19, 2025) ✅
-
-### Issue Summary
-**Problem**: RocksDB error 505 "Found data corruption" during vector search queries
-**Root Cause**: Hardcoded field index mismatch in `rdb_vector_db.cc`
-**Status**: ✅ **RESOLVED** - LSM index fully operational
-
-### Required Fixes
-
-#### Fix 1: Field Index Correction
-**Location**: `/home/kevin/spatial-x-db/storage/rocksdb/rdb_vector_db.cc` (lines 1255 and 1520)
-
-```cpp
-// Changed from {8} to {0}
-// Field index 0 = first non-PK column (vector column 'v')
-std::vector<size_t> field_indexes_to_extract = {0};
-```
-
-**Explanation**: The original hardcoded value `{8}` was designed for a `poi` table with 10 columns. For our table structure `(id INT PRIMARY KEY, v JSON)`, the vector column is at field index 0 (first non-primary-key field).
-
-⚠️ **Note**: This field index is table-specific and must be adjusted based on your schema.
-
-#### Fix 2: Centroid Loading at C++ Level
-Centroids must be loaded at the RocksDB C++ level, not via SQL. The implementation in `/home/kevin/spatial-x-db/rocksdb/table/block_based/block_based_table_factory.h` handles this automatically during table initialization.
-
-## Next Steps
-
-### ✅ Completed (October 19, 2025)
-1. ✅ **Generate Proper Centroids** - DONE
-   - Created `generate_centroids.py` script with RocksDB format support
-   - Generated 256 centroids using k-means clustering
-   - Output: `/home/kevin/spatial-x-db/vector_index_centroids/centroids_openai_1536d_256.csv`
-
-2. ✅ **Fix LSM Index Error 505** - DONE
-   - Identified root cause: Hardcoded field index mismatch
-   - Fixed field index from `{8}` to `{0}` in `rdb_vector_db.cc`
-   - Verified fix with 3D test vectors and full 1536D dataset
-   - All tests passing: load, serial search, concurrent search
-
-3. ✅ **Comprehensive Testing** - DONE
-   - Tested with 50K vectors (1536D)
-   - Serial search: ~18 QPS, 6.15% recall
-   - Concurrent search: Linear scaling up to concurrency=10 (~110 QPS)
-   - Identified memory limits: OOM at concurrency=80
-
-### 🚀 Immediate Next Steps (Ready to Execute)
-1. **Benchmark Larger Datasets**
-   - Test with Performance1536D500K (500K vectors)
-   - Test with Performance1536D5M (5M vectors)
-   - Measure QPS, recall, and latency at scale
-   - Identify optimal concurrency levels for different dataset sizes
-
-2. **Memory Optimization Investigation**
-   - Profile memory usage during concurrent search
-   - Investigate LSM iterator memory consumption
-   - Explore RocksDB block cache tuning options
-   - Document optimal settings for different RAM configurations
-
-### Future Enhancements
-1. **Distance Metric Support**
-   - Implement `FB_VECTOR_COSINE()` when available in MyRocks
-   - Implement `FB_VECTOR_IP()` when available in MyRocks
-   - Update `search_embedding()` to use appropriate function based on metric
-
-2. **Index Configuration Options**
-   - Make centroid path configurable (currently hardcoded)
-   - Add num_centroids parameter to config (default: 256)
-   - Explore optimal centroid count for different dataset sizes (128, 512, 1024)
-   - Test different clustering algorithms (MiniBatchKMeans vs standard KMeans)
-
-3. **Performance Optimization**
-   - Optimize vector JSON conversion (current bottleneck during insert)
-   - Add connection pooling for better concurrent performance
-   - Investigate batch insert optimizations
-   - Tune RocksDB parameters (block size, cache size, compaction)
-
-4. **Field Index Flexibility**
-   - Remove hardcoded field index in `rdb_vector_db.cc`
-   - Make field index configurable based on table schema
-   - Support multiple vector columns in same table
-   - Add validation to detect field index mismatches
-
-5. **Testing & Validation**
-   - Create unit tests for vector operations
-   - Add integration tests with various table structures
-   - Benchmark recall@k for different centroid counts
-   - Compare performance with other vector databases in VectorDBBench
-
-## Quick Start Guide
-
-### Running Benchmarks with LSM Index
-
-**Step 1: Generate Centroids**
 ```bash
-# Generate centroids from your training data using k-means clustering
-python generate_centroids.py \
-  --dataset-path /tmp/vectordb_bench/dataset/openai/openai_small_50k/shuffle_train.parquet \
+# Cohere 768D (256 balanced clusters)
+python generate_centroids_balanced.py \
+  --dataset-path /tmp/vectordb_bench/dataset/cohere/cohere_medium_1m/train.parquet \
   --num-centroids 256 \
-  --output /tmp/myrocks_centroids.csv
+  --output /home/kunhao/spatial-x-db/vector_index_centroids/centroids_cohere_768d_256_balanced.csv \
+  --max-iter 300 \
+  --training-sample-size 300000 \
+  --rocksdb-format
+
+# Cohere 768D (512 balanced clusters)
+python generate_centroids_balanced.py \
+  --dataset-path /tmp/vectordb_bench/dataset/cohere/cohere_medium_1m/train.parquet \
+  --num-centroids 512 \
+  --output /home/kunhao/spatial-x-db/vector_index_centroids/centroids_cohere_768d_512_balanced.csv \
+  --max-iter 300 \
+  --training-sample-size 300000 \
+  --rocksdb-format
 ```
 
-**Expected Output:**
+**Benefits of Balanced k-means**:
+- Enforces equal-sized clusters (±1 vector on training data)
+- GPU-accelerated (5-15 minutes vs 30-60 minutes on CPU)
+- Better cluster balance leads to more consistent search performance
+- Uses PyTorch balanced-kmeans library
+
+**Output Format** (RocksDB):
 ```
-==============================================================
-MyRocks Centroid Generation
-==============================================================
-Dataset: /tmp/vectordb_bench/dataset/openai/openai_small_50k/shuffle_train.parquet
-Output: /tmp/myrocks_centroids.csv
-Number of centroids: 256
+"[0.154, 0.338, -0.033, ...]"
+"[0.157, 0.093, -0.037, ...]"
 ...
-K-means clustering completed in 3.56 seconds
-✓ Successfully saved centroids to /tmp/myrocks_centroids.csv
-  File size: 8851.47 KB
 ```
 
-**Step 2: Run Benchmark**
+## Running Benchmarks
+
+### Cohere 768D - Basic
 ```bash
-# Run complete benchmark with LSM index
 python -m vectordb_bench.cli.vectordbbench myrocks \
-  --username root \
-  --password YOUR_PASSWORD \
-  --host 127.0.0.1 \
-  --port 3306 \
-  --db-label "myrocks-lsm" \
-  --case-type Performance1536D50K \
-  --drop-old
+  --password 150131 \
+  --case-type Performance768D1M \
+  --db-label "myrocks-cohere-768d-l2"
 ```
 
-**Step 3: Load-Only Test (Optional)**
+### Cohere 768D - With nprobe Configuration
 ```bash
-# Test just data loading without search
+# nprobe=16 (default, high recall)
 python -m vectordb_bench.cli.vectordbbench myrocks \
-  --username root \
-  --password YOUR_PASSWORD \
-  --case-type Performance1536D50K \
-  --drop-old \
-  --load \
-  --skip-search-serial \
-  --skip-search-concurrent
+  --password 150131 \
+  --case-type Performance768D1M \
+  --db-label "myrocks-512c-nprobe16" \
+  --nprobe 16
+
+# nprobe=8 (balanced)
+python -m vectordb_bench.cli.vectordbbench myrocks \
+  --password 150131 \
+  --case-type Performance768D1M \
+  --db-label "myrocks-512c-nprobe8" \
+  --nprobe 8
+
+# nprobe=4 (high throughput)
+python -m vectordb_bench.cli.vectordbbench myrocks \
+  --password 150131 \
+  --case-type Performance768D1M \
+  --db-label "myrocks-512c-nprobe4" \
+  --nprobe 4
 ```
 
-### Connection Parameters
-- `--username`: MySQL username (default: root)
-- `--password`: MySQL password (required)
-- `--host`: MySQL host (default: 127.0.0.1)
-- `--port`: MySQL port (default: 3306)
-- `--db-label`: Label for test run
-- `--case-type`: Test case to run (e.g., Performance1536D50K)
+### Common Options
+- `--drop-old`: Drop existing database
+- `--load`: Run data loading phase
+- `--skip-search-serial`: Skip serial search
+- `--skip-search-concurrent`: Skip concurrent search
+- `--skip-load`: Skip loading dataset (necessary for search benchmark)
+- `--num-concurrency "1,5,10"`: Limit concurrency levels (recommended for OOM avoidance)
+- `--nprobe <N>`: Number of nearest centroids to search (1-10000, default: 16)
 
-## Technical Details
+## Database Schema
 
-### Vector Data Flow
-1. **Input**: Python list of floats `[0.1, 0.2, 0.3, ...]`
-2. **Conversion**: `json.dumps(vector)` → `"[0.1, 0.2, 0.3, ...]"`
-3. **Storage**: `INSERT INTO table (id, v) VALUES (1, CAST('[0.1,0.2,0.3]' AS JSON))`
-4. **Search**: `FB_VECTOR_L2(table.v, '[query_vector]')`
-
-### Database Schema
 ```sql
--- Main vector table
+-- Vector table
 CREATE TABLE vec_collection (
     id INT PRIMARY KEY,
-    v JSON NOT NULL FB_VECTOR_DIMENSION 1536
+    v JSON NOT NULL FB_VECTOR_DIMENSION 768
 ) ENGINE=ROCKSDB;
 
--- Centroid table (for LSM index)
-CREATE TABLE vec_collection_centroids (
-    id INT PRIMARY KEY,
-    centroid JSON NOT NULL FB_VECTOR_DIMENSION 1536
-) ENGINE=ROCKSDB;
-
--- Vector index (commented out until centroids available)
--- ALTER TABLE vec_collection
--- ADD INDEX v_idx(v) FB_VECTOR_INDEX_TYPE 'lsmidx';
+-- LSM vector index (created during optimize phase)
+ALTER TABLE vec_collection
+ADD INDEX v_idx(v) FB_VECTOR_INDEX_TYPE 'lsmidx';
 ```
 
-## Code Locations (For Future Reference)
+## Benchmark Results Summary
 
-### Key Methods to Update When Adding LSM Index
-1. **Enable index creation**: `myrocks.py:226-257` (currently commented out)
-   - Uncomment lines 240-257 to enable LSM index
-   - Replace `self._generate_random_centroids()` call with `self._load_centroids_from_csv(csv_path)`
+### Load Phase (Cohere 768D, 1M vectors)
 
-2. **Centroid loading**: `myrocks.py:174-224`
-   - CSV format: `id,centroid` where centroid is JSON array string
-   - Example: `0,"[0.1,0.2,0.3,...]"`
+#### 256 Centroids
+- **Insert Duration**: 1244.21s (~20.7 min)
+- **Insert Rate**: ~804 vectors/second
+- **Optimize Duration**: 0.0018s
 
-3. **Metric type handling**: `config.py:39-46`
-   - Currently accepts L2/COSINE/IP but uses L2 for all
-   - Update when MyRocks adds FB_VECTOR_COSINE and FB_VECTOR_IP functions
+#### 512 Centroids
+- **Insert Duration**: 1199.11s (~20.0 min)
+- **Insert Rate**: ~834 vectors/second
+- **Optimize Duration**: 0.0016s
 
-4. **Search implementation**: `myrocks.py:289-314`
-   - Currently only uses FB_VECTOR_L2
-   - Add logic to switch between distance functions based on metric_type
+### Search Phase Results (Cohere 768D, 1M vectors)
 
-### Important Configuration Details
-- **Index type mapping**: Uses `IndexType.Flat` as placeholder for LSM (no LSM in IndexType enum)
-- **Case config**: `_myrocks_case_config` in `config.py:64-66`
-- **DB registration**: `__init__.py:54, 204-207, 360-363, 491-494`
-- **CLI registration**: `vectordbbench.py:9, 45`
+#### 256 Centroids, nprobe=16 (default)
+- **Serial QPS**: 5.91
+- **Serial P99 Latency**: 1.42s
+- **Serial P95 Latency**: 1.38s
+- **Recall@100**: 96.57%
+- **NDCG@100**: 96.91%
+- **Concurrent (c=1)**: QPS=0.82, P99=1.35s, Avg=1.22s
+- **Concurrent (c=5)**: QPS=3.69, P99=1.54s, Avg=1.35s
+- **Concurrent (c=10)**: QPS=5.91, P99=2.34s, Avg=1.65s
 
-## Known Limitations
+#### 512 Centroids, nprobe=16 (default)
+- **Serial QPS**: 7.76
+- **Serial P99 Latency**: 1.11s
+- **Serial P95 Latency**: 1.06s
+- **Recall@100**: 94.60%
+- **NDCG@100**: 95.07%
+- **Concurrent (c=1)**: QPS=1.04, P99=1.24s, Avg=0.96s
+- **Concurrent (c=5)**: QPS=4.76, P99=1.30s, Avg=1.04s
+- **Concurrent (c=10)**: QPS=7.76, P99=2.02s, Avg=1.27s
 
-### Distance Metrics
-- **Supported**: L2 (Euclidean) distance via `FB_VECTOR_L2()`
-- **Not Yet Available**: COSINE and Inner Product (IP)
-- **Current Behavior**: All metrics fall back to L2 distance
+#### 512 Centroids, nprobe=8
+- **Serial QPS**: 11.25
+- **Serial P99 Latency**: 0.96s
+- **Serial P95 Latency**: 0.91s
+- **Recall@100**: 87.21%
+- **NDCG@100**: 88.18%
+- **Concurrent (c=1)**: QPS=0.13, P99=10.72s, Avg=7.84s
+- **Concurrent (c=5)**: QPS=4.70, P99=4.31s, Avg=1.05s
+- **Concurrent (c=10)**: QPS=11.25, P99=1.48s, Avg=0.88s
 
-### Concurrency
-- **Recommended**: Up to 10-20 concurrent connections
-- **High Concurrency**: 80+ connections may cause OOM on systems with 15GB RAM or less
+#### 512 Centroids, nprobe=4
+- **Serial QPS**: 19.76
+- **Serial P99 Latency**: 0.55s
+- **Serial P95 Latency**: 0.52s
+- **Recall@100**: 75.90%
+- **NDCG@100**: 77.42%
+- **Concurrent (c=1)**: QPS=2.50, P99=0.54s, Avg=0.40s
+- **Concurrent (c=5)**: QPS=11.77, P99=0.60s, Avg=0.42s
+- **Concurrent (c=10)**: QPS=19.76, P99=0.83s, Avg=0.50s
 
-## Dependencies
+## Dataset Status
 
-### Python Packages
-- `mysql-connector-python`: MySQL database connector
-- `numpy`: Vector operations
-- `json`: Vector serialization
+| Dataset | Dimension | Metric | Ground Truth | Centroids | Status |
+|---------|-----------|--------|--------------|-----------|--------|
+| Cohere  | 768D      | L2     | ✅ Generated  | ✅ 256, 512 (std & balanced) | ✅ Ready |
+| GIST    | 960D      | L2     | ⚠️ TBD       | ✅ 256 (FAISS) | ✅ Ready |
 
-### Database Requirements
-- MyRocks (MySQL with RocksDB storage engine)
-- Facebook vector extensions enabled
-- Vector functions available: `FB_VECTOR_L2()`, `FB_VECTOR_DIMENSION`, `FB_VECTOR_INDEX_TYPE`
+**Current Active Configuration**: Cohere 512 balanced centroids
+
+**Notes**:
+- Cohere dataset has L2-based ground truth, providing valid recall/NDCG metrics for MyRocks benchmarking
+- GIST dataset downloaded (Oct 26, 2025), centroids generated using FAISS k-means optimized for IVF
+- Both standard k-means and balanced k-means centroids available for Cohere
+- See `CENTROID_GENERATION.md` for centroid generation guide
 
 ## Important Notes
 
 ### LSM Index Requirements
-The LSM vector index requires:
-1. **Proper centroids**: Generated via k-means clustering on actual training data (not random)
-2. **C++ level loading**: Centroids are loaded at RocksDB C++ initialization (see `block_based_table_factory.h`)
-3. **Field index alignment**: Field index in `rdb_vector_db.cc` must match table schema
+1. **Proper centroids**: Generated via k-means clustering on training data
+2. **C++ level loading**: Centroids loaded at RocksDB initialization
+3. **Field index alignment**: Must match table schema (currently `{0}`)
+4. **Dimension match**: `vector_dim` must match dataset dimension
+5. **Rebuild required**: Any C++ changes require recompilation
 
-### Table-Specific Configuration
-The field index in `/home/kevin/spatial-x-db/storage/rocksdb/rdb_vector_db.cc` is hardcoded to `{0}` for the standard VectorDBBench table structure `(id INT PRIMARY KEY, v JSON)`. If you use a different table schema, adjust this value accordingly.
+### nprobe Parameter
+- **Purpose**: Controls number of nearest centroids to search
+- **Range**: 1-10000 (default: 16)
+- **Trade-off**: Lower nprobe = faster search, lower recall; Higher nprobe = slower search, higher recall
+- **Session variable**: `fb_vector_search_nprobe`
+- **CLI option**: `--nprobe <N>` in VectorDBBench
+
+### Limitations
+- **Distance metric**: L2 only (COSINE/IP not supported)
+- **Connection**: Unix socket only in this environment
+- **Hardcoded configuration**: Dimension and centroid path require C++ changes
+
+### Storage Requirements
+**1M Vectors (Cohere 768D)**:
+- ~12GB RocksDB data
+- ~25GB total disk usage
+
+**Peak Memory**: 50GB+ during concurrent search (concurrency 20)
+
+## Quick Reference
+
+### File Locations
+- **VectorDBBench**: `/home/kunhao/VectorDBBench`
+- **spatial-x-db**: `/home/kunhao/spatial-x-db`
+- **MySQL Socket**: `/home/kunhao/myrocks-runtime/mysql.sock`
+- **Cohere Dataset**: `/tmp/vectordb_bench/dataset/cohere/cohere_medium_1m/`
+- **Active Centroids**: `/home/kunhao/spatial-x-db/vector_index_centroids/centroids_cohere_768d_512_balanced.csv`
+- **All Centroids**: `/home/kunhao/spatial-x-db/vector_index_centroids/`
+
+### Key Configuration Values
+- **Vector Dimension**: 768
+- **Active Centroids**: 512 (balanced k-means)
+- **Field Index**: 0
+- **MySQL Password**: 150131
+- **Table Structure**: `(id INT PRIMARY KEY, v JSON NOT NULL FB_VECTOR_DIMENSION 768)`
+- **nprobe Range**: 1-10000 (recommended: 4-16)
+
+### Quick Commands
+
+**Rebuild MyRocks after changing centroids**:
+```bash
+cd /home/kunhao/spatial-x-db
+make -j$(nproc)
+# Kill and restart MySQL server
+```
+
+**Load data**:
+```bash
+python -m vectordb_bench.cli.vectordbbench myrocks \
+  --password 150131 \
+  --case-type Performance768D1M \
+  --db-label "myrocks-512bal" \
+  --drop-old --load \
+  --skip-search-serial --skip-search-concurrent
+```
+
+**Search benchmark (nprobe sweep)**:
+```bash
+# Load once, then search with different nprobe values
+for nprobe in 4 8 16; do
+  python -m vectordb_bench.cli.vectordbbench myrocks \
+    --password 150131 \
+    --case-type Performance768D1M \
+    --db-label "myrocks-512bal-nprobe${nprobe}" \
+    --nprobe $nprobe \
+    --skip-load \
+    --num-concurrency "1,5,10"
+done
+```
+
+## Troubleshooting
+
+### Issue 1: Zero Recall After Loading Data (Oct 24, 2025)
+
+**Symptoms**:
+- Benchmark runs successfully
+- Search queries execute
+- Recall = 0.0, NDCG = 0.0
+- FB_VECTOR_L2 returns 0 results
+
+**Root Cause**:
+MyRocks was not rebuilt after updating the centroids path in C++ configuration.
+
+**Solution**:
+1. Verify centroids file exists at the configured path
+2. Rebuild MyRocks: `cd /home/kunhao/spatial-x-db && make -j$(nproc)`
+3. Restart MySQL server
+4. Drop and reload the database
+5. Verify with manual query:
+```bash
+python -c "
+import mysql.connector
+import json
+
+conn = mysql.connector.connect(
+    user='root',
+    password='150131',
+    unix_socket='/home/kunhao/myrocks-runtime/mysql.sock'
+)
+
+cursor = conn.cursor()
+cursor.execute('USE vectordbbench')
+cursor.execute('SET SESSION fb_vector_search_nprobe = 16')
+
+# Get first vector
+cursor.execute('SELECT v FROM vec_collection WHERE id = 0')
+vec = cursor.fetchone()[0]
+
+# Test search
+cursor.execute(f\"SELECT id FROM vec_collection ORDER BY FB_VECTOR_L2(v, '{vec}') ASC LIMIT 10\")
+results = cursor.fetchall()
+print(f'Results: {len(results)} (should be 10)')
+"
+```
+
+**Expected**: 10 results with ID 0 first
+
+### Issue 2: PyArrow Compatibility Error (Oct 24, 2025)
+
+**Symptoms**:
+```
+TypeError: Cannot convert numpy.ndarray to numpy.ndarray
+```
+
+**Root Cause**:
+PyArrow 21.0.0 was initially incompatible with the environment due to conflicting packages from PyTorch/balanced-kmeans installation.
+
+**Solution**:
+1. Remove conda environment: `conda env remove -n vectordbbench -y`
+2. Create fresh environment: `conda create -n vectordbbench python=3.11 -y`
+3. Install VectorDBBench: `pip install -e .`
+4. Install MySQL connector: `pip install mysql-connector-python`
+5. Verify PyArrow/Pandas compatibility:
+```python
+from pyarrow.parquet import ParquetFile
+pf = ParquetFile('test.parquet', memory_map=True, pre_buffer=True)
+batch = next(pf.iter_batches(100))
+df = batch.to_pandas()  # Should succeed
+```
+
+**Key Packages (Working)**:
+- NumPy: 2.3.4
+- Pandas: 2.3.3
+- PyArrow: 21.0.0
+- MySQL Connector: 9.5.0
+
+### Issue 3: Slow Query Performance with High nprobe
+
+**Symptoms**:
+- nprobe=32: ~1.1 seconds per query
+- Serial search takes ~18 minutes for 1000 queries
+
+**Explanation**:
+This is expected behavior. Higher nprobe values search more centroids:
+- nprobe=4: ~0.55s/query, 75.90% recall
+- nprobe=8: ~0.96s/query, 87.21% recall
+- nprobe=16: ~1.11s/query, 94.60% recall (512c)
+- nprobe=32: ~1.10s/query, higher recall expected
+
+**Recommendation**: Use nprobe=4,8,16 for most benchmarks. nprobe=32 is rarely needed.
 
 ## References
+- VectorDBBench: https://github.com/zilliztech/VectorDBBench
+- Cohere Dataset: 768D, 1M vectors, L2 ground truth
+- Balanced k-means: https://pypi.org/project/balanced-kmeans/
+- CENTROID_GENERATION.md: Detailed balanced centroid generation guide
+- PGVECTOR_LOCAL_SETUP.md: PostgreSQL with pgvector setup guide
 
-- VectorDBBench Repository: https://github.com/zilliztech/VectorDBBench
-- MyRocks Documentation: (Add link when available)
-- Facebook Vector Extensions: (Add link when available)

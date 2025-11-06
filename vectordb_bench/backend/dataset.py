@@ -146,6 +146,7 @@ class GIST(BaseDataset):
     dim: int = 960
     metric_type: MetricType = MetricType.L2
     use_shuffled: bool = False
+    with_gt: bool = False
     _size_label: dict = {
         100_000: SizeLabel(100_000, "SMALL", 1),
         1_000_000: SizeLabel(1_000_000, "MEDIUM", 1),
@@ -155,7 +156,7 @@ class GIST(BaseDataset):
 class Cohere(BaseDataset):
     name: str = "Cohere"
     dim: int = 768
-    metric_type: MetricType = MetricType.COSINE
+    metric_type: MetricType = MetricType.L2  # Changed from COSINE to L2 for MyRocks compatibility
     use_shuffled: bool = config.USE_SHUFFLED_DATA
     with_gt: bool = True
     _size_label: dict = {

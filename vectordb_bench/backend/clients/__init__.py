@@ -52,6 +52,7 @@ class DB(Enum):
     S3Vectors = "S3Vectors"
     Hologres = "Alibaba Cloud Hologres"
     MyRocks = "MyRocks"
+    DuckDB = "DuckDB"
 
     @property
     def init_cls(self) -> type[VectorDB]:  # noqa: PLR0911, PLR0912, C901, PLR0915
@@ -205,6 +206,11 @@ class DB(Enum):
             from .myrocks.myrocks import MyRocks
 
             return MyRocks
+
+        if self == DB.DuckDB:
+            from .duckdb.duckdb_client import DuckDB
+
+            return DuckDB
 
         msg = f"Unknown DB: {self.name}"
         raise ValueError(msg)
@@ -362,6 +368,11 @@ class DB(Enum):
 
             return MyRocksConfig
 
+        if self == DB.DuckDB:
+            from .duckdb.config import DuckDBConfig
+
+            return DuckDBConfig
+
         msg = f"Unknown DB: {self.name}"
         raise ValueError(msg)
 
@@ -492,6 +503,11 @@ class DB(Enum):
             from .myrocks.config import _myrocks_case_config
 
             return _myrocks_case_config.get(index_type)
+
+        if self == DB.DuckDB:
+            from .duckdb.config import _duckdb_case_config
+
+            return _duckdb_case_config.get(index_type)
 
         # DB.Pinecone, DB.Chroma, DB.Redis
         return EmptyDBCaseConfig

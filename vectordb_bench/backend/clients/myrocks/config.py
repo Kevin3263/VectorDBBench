@@ -11,21 +11,18 @@ class MyRocksConfigDict(TypedDict):
 
     user: str
     password: str
-    host: str
-    port: int
+    unix_socket: str
 
 
 class MyRocksConfig(DBConfig):
     user_name: str = "root"
     password: SecretStr
-    host: str = "127.0.0.1"
-    port: int = 3306
+    unix_socket: str = "/home/kunhao/myrocks-runtime/mysql.sock"
 
     def to_dict(self) -> MyRocksConfigDict:
         pwd_str = self.password.get_secret_value()
         return {
-            "host": self.host,
-            "port": self.port,
+            "unix_socket": self.unix_socket,
             "user": self.user_name,
             "password": pwd_str,
         }
@@ -50,6 +47,7 @@ class MyRocksLSMConfig(MyRocksIndexConfig, DBCaseConfig):
     """Configuration for MyRocks LSM-based vector index"""
 
     index: IndexType = IndexType.Flat  # Using Flat as placeholder for LSM
+    nprobe: int = 16  # Number of nearest centroids to search (default: 16)
 
     def index_param(self) -> dict:
         return {
@@ -60,6 +58,7 @@ class MyRocksLSMConfig(MyRocksIndexConfig, DBCaseConfig):
     def search_param(self) -> dict:
         return {
             "metric_type": self.parse_metric(),
+            "nprobe": self.nprobe,
         }
 
 

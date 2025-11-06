@@ -75,18 +75,19 @@ class MyRocks(VectorDB):
             self.cursor.execute(f"USE {self.db_name}")
 
             # Note: Centroids are loaded by RocksDB at C++ level from
-            # /home/kevin/spatial-x-db/vector_index_centroids/centroids_openai_1536d_256.csv
+            # /home/kunhao/spatial-x-db/vector_index_centroids/centroids_cohere_768d_256.csv
             # No need to create a centroid table in SQL
 
-            # Create main vector table
+            # Create main vector table with LSM vector index
+            # MyRocks requires the index to be created with the table, not via ALTER TABLE
             log.info(f"{self.name} client create table : {self.table_name}")
-            # MyRocks uses JSON type for vectors with FB_VECTOR_DIMENSION
-            # Index will be added during optimize() phase
             self.cursor.execute(
                 f"""
               CREATE TABLE {self.table_name} (
-                id INT PRIMARY KEY,
-                v JSON NOT NULL FB_VECTOR_DIMENSION {dim}
+                id INT NOT NULL,
+                v JSON NOT NULL FB_VECTOR_DIMENSION {dim},
+                PRIMARY KEY (id) COMMENT 'cfname=cf1',
+                INDEX v_idx(v) FB_VECTOR_INDEX_TYPE 'lsmidx' COMMENT 'cfname=cf1'
               ) ENGINE=ROCKSDB
             """
             )
@@ -109,6 +110,12 @@ class MyRocks(VectorDB):
         # maximize allowed package size for large vector batches
         self.cursor.execute("SET GLOBAL max_allowed_packet = 1073741824")
         self.conn.commit()
+
+        # Set nprobe parameter for vector search if available in case_config
+        nprobe = self.case_config.search_param().get("nprobe", 16)
+        self.cursor.execute(f"SET SESSION fb_vector_search_nprobe = {nprobe}")
+        self.conn.commit()
+        log.info(f"Set fb_vector_search_nprobe = {nprobe}")
 
         # Prepare insert SQL statement
         # Using CAST to JSON as shown in the example SQL
@@ -218,31 +225,17 @@ class MyRocks(VectorDB):
         assert self.conn is not None, "Connection is not initialized"
         assert self.cursor is not None, "Cursor is not initialized"
 
-        index_param = self.case_config.index_param()
+        # LSM index is already created with the table in _create_db_table()
+        # Centroids are loaded from /home/kunhao/spatial-x-db/vector_index_centroids/centroids_cohere_768d_256.csv
+        # via block_based_table_factory.h SetIndexOptions() method at RocksDB C++ level
 
-        # LSM index now enabled with proper centroids loaded at RocksDB C++ level
-        # Centroids are loaded from /home/kevin/spatial-x-db/vector_index_centroids/centroids_openai_1536d_256.csv
-        # via block_based_table_factory.h SetIndexOptions() method
+        log.info(f"LSM vector index already exists for {self.table_name} (created with table)")
+        log.info(f"Centroids are loaded by RocksDB from C++ code at: /home/kunhao/spatial-x-db/vector_index_centroids/centroids_cohere_768d_256.csv")
 
-        try:
-            log.info(f"Creating LSM vector index for {self.table_name}")
-            log.info(f"Note: Centroids are loaded by RocksDB from C++ code, not via SQL")
-
-            # Create vector index using FB_VECTOR_INDEX_TYPE
-            # Default to 'lsmidx' for LSM-based index
-            index_name = f"{self.table_name}_v_idx"
-            self.cursor.execute(
-                f"""
-              ALTER TABLE {self.db_name}.{self.table_name}
-              ADD INDEX {index_name}(v) FB_VECTOR_INDEX_TYPE 'lsmidx'
-            """
-            )
-            self.conn.commit()
-            log.info(f"LSM vector index created successfully for {self.table_name}")
-
-        except Exception as e:
-            log.warning(f"Failed to create LSM index: {self.table_name} error: {e}")
-            raise e from None
+        # Flush tables to ensure data is written to RocksDB
+        self.cursor.execute("FLUSH TABLES")
+        self.conn.commit()
+        log.info(f"Tables flushed - optimize complete")
 
     @staticmethod
     def vector_to_json(v):  # noqa: ANN001
