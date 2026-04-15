@@ -3,6 +3,7 @@ from ..backend.clients.aws_opensearch.cli import AWSOpenSearch
 from ..backend.clients.clickhouse.cli import Clickhouse
 from ..backend.clients.hologres.cli import HologresHGraph
 from ..backend.clients.lancedb.cli import LanceDB
+from ..backend.clients.lance_ivf.cli import LanceIvfFlat, LanceIvfSQ8, LanceIvfRaBitQ
 from ..backend.clients.mariadb.cli import MariaDBHNSW
 from ..backend.clients.memorydb.cli import MemoryDB
 from ..backend.clients.milvus.cli import MilvusAutoIndex
@@ -47,6 +48,9 @@ cli.add_command(TiDB)
 cli.add_command(Clickhouse)
 cli.add_command(Vespa)
 cli.add_command(LanceDB)
+cli.add_command(LanceIvfFlat)
+cli.add_command(LanceIvfSQ8)
+cli.add_command(LanceIvfRaBitQ)
 cli.add_command(HologresHGraph)
 cli.add_command(QdrantCloud)
 cli.add_command(QdrantLocal)
